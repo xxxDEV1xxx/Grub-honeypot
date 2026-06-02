@@ -1,0 +1,890 @@
+#!/usr/bin/env python3
+"""
+CTW-11 GHOST SHELL
+==================
+Three-layer deception architecture:
+
+LAYER 0 — GRUB hook (before their toolkit)
+  Runs before xhci_hcd loads at 0.827s
+  Sets up framebuffer ownership
+  Creates hidden real session
+
+LAYER 1 — PUPPET (what AMT KVM sees on VT1)
+  Automated forensic activity simulation
+  Human-like typing speed and mistakes
+  Random file access patterns
+  Appears to be real investigator working
+
+LAYER 2 — GHOST (real session, hidden)
+  Runs on VT7 or nested PTY
+  Framebuffer writes go to VT1 only
+  AMT KVM reads VT1 framebuffer
+  Real work invisible to KVM
+
+Author: CTW-11
+"""
+
+import os
+import sys
+import pty
+import tty
+import time
+import random
+import signal
+import struct
+import threading
+import subprocess
+import termios
+import fcntl
+import select
+import math
+from datetime import datetime
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+# VT assignments
+PUPPET_VT     = 1   # AMT KVM watches this
+REAL_VT       = 7   # Our actual work
+DUMMY_VT      = 2   # Decoy crash/error terminal
+
+# Framebuffer
+FB_DEVICE     = '/dev/fb0'
+FB_VT1        = '/dev/vcs1'
+FB_VT1U       = '/dev/vcsu1'
+
+# Ghost shell socket
+GHOST_SOCKET  = '/tmp/.ctw_ghost'
+
+# Evidence output
+EVIDENCE_DIR  = '/tmp/CTW_GHOST_EVIDENCE'
+
+# Timing — human simulation parameters
+MIN_KEYSTROKE = 0.04   # 40ms minimum between keys
+MAX_KEYSTROKE = 0.18   # 180ms maximum
+THINK_MIN     = 0.8    # Pause before commands
+THINK_MAX     = 4.2    # Longer pauses = reading
+TYPO_RATE     = 0.03   # 3% typo probability
+BACKSPACE_DLY = 0.12   # Time to notice and fix typo
+
+# ============================================================
+# REAL FILES TO FAKE-BROWSE
+# Attacker sees us opening these — they look juicy
+# but reveal nothing they don't already know
+# ============================================================
+
+DECOY_FILES = [
+    '/etc/passwd',
+    '/etc/hosts',
+    '/proc/cmdline',
+    '/proc/version',
+    '/var/log/messages',
+    '/var/log/secure',
+    '/boot/grub2/grub.cfg',
+    '/etc/fstab',
+    '/proc/bus/input/devices',
+    '/sys/firmware/acpi/tables/DSDT',
+    '/tmp/CTW_FORENSIC_fake/evidence.txt',
+    '/tmp/CTW_FORENSIC_fake/hid_dump.txt',
+    '/tmp/CTW_FORENSIC_fake/network.txt',
+]
+
+# Fake forensic commands that look productive
+# but are already known to the attacker
+DECOY_COMMANDS = [
+    'ls -la /sys/class/input/',
+    'cat /proc/bus/input/devices',
+    'dmesg | grep -i bluetooth',
+    'lsmod | grep hci',
+    'lsusb -t',
+    'ss -tupan',
+    'ps aux | grep -v grep',
+    'find /sys/bus/hid/devices -name uevent',
+    'cat /sys/firmware/acpi/interrupts/error',
+    'ls -la /dev/input/',
+    'journalctl -b | grep -i acpi | tail -20',
+    'lsusb -v 2>/dev/null | grep -i chicony',
+    'dmesg | grep "Hardware Unit Hang"',
+    'cat /tmp/CTW_COLOR_SIGNATURE*.txt 2>/dev/null',
+    'sha256sum /boot/vmlinuz-$(uname -r)',
+]
+
+# Commands that appear to be making progress
+# toward conclusions attacker already knows
+MILESTONE_COMMANDS = [
+    'echo "Found GUID 5cb5c776... documenting"',
+    'cat /tmp/CTW_BOOT_*/bt_timeline.txt',
+    'grep "rcm0" /tmp/CTW_FORENSIC_*/acpi.txt',
+    'echo "AMT KVM confirmed - preparing filing"',
+    'sha256sum /tmp/CTW_COLOR_SIGNATURE*.txt',
+]
+
+# ============================================================
+# LAYER 0: GRUB PRE-HOOK INSTALLER
+# Injects before xhci_hcd at 0.827s
+# ============================================================
+
+GRUB_HOOK = '''#!/bin/bash
+# CTW-11 GHOST SHELL GRUB HOOK
+# Runs from initramfs before USB initializes
+# Establishes framebuffer ownership before
+# AMT KVM gets a clean read
+
+# Switch to VT1 immediately
+chvt 1
+
+# Set VT1 as owned by puppet process
+# VT7 as hidden real session
+openvt -c 7 -f -- /bin/bash --login &
+GHOST_PID=$!
+
+# Write ghost PID to initramfs tmpfs
+echo $GHOST_PID > /run/ctw_ghost.pid
+
+# Lock VT switching from VT1
+# Attacker cannot chvt away from puppet
+# (they would need to send keystroke to do it)
+# fgconsole returns 1 = we own VT1
+
+# Start puppet on VT1 immediately
+openvt -c 1 -f -- \
+  /tmp/ctw_ghost/puppet.sh &
+
+echo "CTW-11 Ghost Shell initialized"
+'''
+
+INITRAMFS_HOOK = '''#!/bin/sh
+# /etc/initramfs-tools/scripts/init-premount/ctw_ghost
+# Runs at initramfs stage, before any hardware init
+
+PREREQS=""
+prereqs() { echo "$PREREQS"; }
+
+case $1 in
+    prereqs)
+        prereqs
+        exit 0
+        ;;
+esac
+
+. /scripts/functions
+
+# Create ghost workspace in tmpfs
+mkdir -p /run/ctw_ghost
+
+# Switch framebuffer to our control
+# BEFORE AMT KVM registers its handler
+echo 1 > /sys/class/vtconsole/vtcon0/bind \
+  2>/dev/null
+echo 1 > /sys/class/vtconsole/vtcon1/bind \
+  2>/dev/null
+
+# Fork real session to VT7
+# invisible to VT1 framebuffer read
+setsid /bin/sh < /dev/tty7 \
+  > /dev/tty7 2>&1 &
+
+log_begin_msg "CTW-11 Ghost Shell: framebuffer secured"
+log_end_msg 0
+'''
+
+# ============================================================
+# LAYER 1: PUPPET ENGINE
+# ============================================================
+
+class HumanTypingEngine:
+    """
+    Simulates realistic human typing patterns
+    including thinking pauses, typos, corrections
+    and reading behavior (scroll, pause, scroll)
+    """
+
+    def __init__(self, output_fd):
+        self.out    = output_fd
+        self.speed  = random.uniform(0.8, 1.2)  # Individual speed factor
+
+    def write(self, text):
+        os.write(self.out, text.encode() if isinstance(text, str) else text)
+
+    def type_char(self, char):
+        """Type a single character with realistic delay"""
+        delay = random.gauss(
+            (MIN_KEYSTROKE + MAX_KEYSTROKE) / 2,
+            (MAX_KEYSTROKE - MIN_KEYSTROKE) / 4
+        ) * self.speed
+        delay = max(MIN_KEYSTROKE, min(MAX_KEYSTROKE, delay))
+        time.sleep(delay)
+
+        # Random typo
+        if random.random() < TYPO_RATE and char.isalpha():
+            # Type wrong key (adjacent key on keyboard)
+            adjacent = self._adjacent_key(char)
+            self.write(adjacent)
+            time.sleep(BACKSPACE_DLY)
+            self.write('\x7f')  # Backspace
+            time.sleep(0.05)
+
+        self.write(char)
+
+    def _adjacent_key(self, char):
+        """Return a keyboard-adjacent character for typo simulation"""
+        rows = ['qwertyuiop', 'asdfghjkl', 'zxcvbnm']
+        for row in rows:
+            idx = row.find(char.lower())
+            if idx >= 0:
+                neighbors = []
+                if idx > 0: neighbors.append(row[idx-1])
+                if idx < len(row)-1: neighbors.append(row[idx+1])
+                if neighbors:
+                    typo = random.choice(neighbors)
+                    return typo.upper() if char.isupper() else typo
+        return char
+
+    def type_command(self, cmd):
+        """Type a full command with human-like behavior"""
+        # Thinking pause before typing
+        think = random.uniform(THINK_MIN, THINK_MAX)
+        time.sleep(think)
+
+        for char in cmd:
+            self.type_char(char)
+
+        # Pause before Enter (reviewing command)
+        time.sleep(random.uniform(0.3, 1.2))
+        self.write('\n')
+
+    def scroll_output(self, lines=20):
+        """Simulate reading output — pauses at interesting lines"""
+        for i in range(lines):
+            # Occasionally pause as if reading
+            if random.random() < 0.15:
+                time.sleep(random.uniform(1.0, 3.0))
+            else:
+                time.sleep(random.uniform(0.02, 0.08))
+
+    def think(self, min_t=None, max_t=None):
+        """General thinking pause"""
+        t = random.uniform(
+            min_t or THINK_MIN,
+            max_t or THINK_MAX
+        )
+        time.sleep(t)
+
+
+class PuppetTerminal:
+    """
+    Manages the decoy terminal session on VT1.
+    Runs realistic forensic activity that the
+    attacker watches via AMT KVM.
+    """
+
+    def __init__(self):
+        self.running    = True
+        self.evidence   = []
+        self.session_log = []
+
+        os.makedirs(EVIDENCE_DIR, exist_ok=True)
+        os.makedirs('/tmp/CTW_FORENSIC_fake', exist_ok=True)
+
+        # Create fake evidence files for puppet to open
+        self._create_fake_evidence()
+
+    def _create_fake_evidence(self):
+        """
+        Create convincing fake forensic files.
+        Puppet opens these — attacker sees
+        content that mirrors what they already know.
+        No new information disclosed.
+        """
+        fake_hid = """
+=== CTW HID FORENSIC CAPTURE ===
+Date: {}
+Gaming KB 258a:1006 - 4 interfaces
+Interface 0: event19 (keyboard - legitimate)
+Interface 1: event21,22,28 (suspicious)
+ABS=6600000001000003 - CONFIRMED ANOMALY
+Input159 gap detected - 140 node offset
+Documenting for FCC filing...
+""".format(datetime.now().isoformat())
+
+        fake_network = """
+=== NETWORK STATE CAPTURE ===
+AMT ports 16992/16993 - BLOCKED
+sssd connections - TERMINATED
+vhci watchdog - 381ms respawn documented
+Bluetooth stack - DISABLED
+rcm0 0x384f5768 - POISONED
+Signing server - REDIRECTED
+"""
+
+        with open('/tmp/CTW_FORENSIC_fake/hid_dump.txt', 'w') as f:
+            f.write(fake_hid)
+        with open('/tmp/CTW_FORENSIC_fake/network.txt', 'w') as f:
+            f.write(fake_network)
+        with open('/tmp/CTW_FORENSIC_fake/evidence.txt', 'w') as f:
+            f.write("CTW-WP-002 evidence compilation in progress...\n")
+
+    def _get_next_action(self):
+        """
+        Choose next puppet action based on
+        weighted random selection.
+        Builds a realistic forensic workflow.
+        """
+        roll = random.random()
+
+        if roll < 0.40:
+            # Run a forensic command
+            return ('command', random.choice(DECOY_COMMANDS))
+        elif roll < 0.55:
+            # Open and scroll a file
+            return ('file', random.choice(DECOY_FILES))
+        elif roll < 0.65:
+            # Run a milestone command
+            return ('milestone', random.choice(MILESTONE_COMMANDS))
+        elif roll < 0.75:
+            # Grep through something
+            term = random.choice([
+                'bluetooth', 'acpi', 'error',
+                'usb', 'hci', '258a', 'vhci',
+                'rcm0', 'GUID', 'signing'
+            ])
+            target = random.choice([
+                '/var/log/messages',
+                '/tmp/CTW_FORENSIC_fake/hid_dump.txt',
+                'dmesg'
+            ])
+            if target == 'dmesg':
+                cmd = f"dmesg | grep -i '{term}' | tail -15"
+            else:
+                cmd = f"grep -i '{term}' {target}"
+            return ('command', cmd)
+        else:
+            # Just think (idle at prompt)
+            return ('idle', None)
+
+    def run(self, master_fd):
+        """Main puppet loop"""
+        typer = HumanTypingEngine(master_fd)
+
+        # Initial session setup — looks like
+        # investigator just logged in
+        time.sleep(2.0)
+        typer.type_command('clear')
+        time.sleep(0.5)
+        typer.type_command('echo "CTW-11 FORENSIC SESSION $(date)"')
+        time.sleep(1.0)
+        typer.type_command('ls /tmp/CTW_FORENSIC_*/  2>/dev/null | head -20')
+        typer.scroll_output(10)
+
+        # Main puppet loop
+        session_start = time.time()
+
+        while self.running:
+            action_type, action_data = self._get_next_action()
+
+            if action_type == 'command':
+                typer.type_command(action_data)
+                typer.scroll_output(
+                    random.randint(5, 25)
+                )
+
+            elif action_type == 'file':
+                # Open file with less/cat
+                viewer = random.choice(['cat', 'less', 'head -50'])
+                cmd = f"{viewer} {action_data} 2>/dev/null"
+                typer.type_command(cmd)
+
+                if 'less' in viewer:
+                    # Simulate scrolling through file
+                    scroll_count = random.randint(3, 12)
+                    for _ in range(scroll_count):
+                        time.sleep(random.uniform(0.5, 2.5))
+                        # Space bar to scroll
+                        os.write(master_fd, b' ')
+                    # q to quit less
+                    time.sleep(random.uniform(0.3, 1.0))
+                    os.write(master_fd, b'q')
+                else:
+                    typer.scroll_output(random.randint(10, 30))
+
+            elif action_type == 'milestone':
+                # Milestone commands — appear significant
+                # Pause longer before, look more deliberate
+                typer.think(3.0, 8.0)
+                typer.type_command(action_data)
+                typer.scroll_output(5)
+
+            elif action_type == 'idle':
+                # Just sit at prompt
+                # Attacker sees idle cursor
+                typer.think(5.0, 15.0)
+
+            # Log puppet activity for our analysis
+            self.session_log.append({
+                'time': time.time() - session_start,
+                'action': action_type,
+                'data': action_data
+            })
+
+
+# ============================================================
+# LAYER 2: GHOST SESSION
+# Hidden from AMT KVM, runs on separate VT
+# ============================================================
+
+class GhostSession:
+    """
+    The real session — hidden from attacker.
+
+    AMT KVM reads /dev/fb0 which reflects VT1.
+    Real work happens on VT7.
+    VT switching is locked so attacker can't
+    chvt to VT7 even with keyboard injection.
+    """
+
+    def __init__(self):
+        self.puppet_pid = None
+        self.ghost_pid  = None
+        self.monitor    = AccessMonitor()
+
+    def lock_vt_switching(self):
+        """
+        Prevent attacker from switching VTs.
+        Their keyboard injection can send chvt
+        or Ctrl+Alt+F7 — we block this.
+        """
+        try:
+            # Lock VT from keyboard switching
+            # ioctl VT_LOCKSWITCH = 0x5600 + 3
+            import fcntl
+            fd = os.open('/dev/tty1', os.O_RDWR)
+            VT_LOCKSWITCH = 0x5603
+            fcntl.ioctl(fd, VT_LOCKSWITCH, 0)
+            os.close(fd)
+            print("[GHOST] VT switching locked")
+        except Exception as e:
+            print(f"[GHOST] VT lock: {e}")
+
+    def start_puppet(self):
+        """Fork puppet onto VT1"""
+        master, slave = pty.openpty()
+
+        pid = os.fork()
+        if pid == 0:
+            # Child — puppet process on VT1
+            os.setsid()
+
+            # Connect to VT1
+            fd = os.open('/dev/tty1', os.O_RDWR)
+            for i in range(3):
+                os.dup2(fd, i)
+            os.close(fd)
+
+            # Run shell for puppet to control
+            os.execv('/bin/bash', ['/bin/bash', '--norc', '--noprofile'])
+            os._exit(1)
+
+        self.puppet_pid = pid
+
+        # Drive puppet from master PTY
+        puppet = PuppetTerminal()
+        puppet_thread = threading.Thread(
+            target=puppet.run,
+            args=(master,),
+            daemon=True
+        )
+        puppet_thread.start()
+
+        print(f"[GHOST] Puppet started PID={pid}")
+        return master
+
+    def start_ghost(self):
+        """Fork real session onto VT7"""
+        pid = os.fork()
+        if pid == 0:
+            os.setsid()
+            # Connect to VT7
+            fd = os.open('/dev/tty7', os.O_RDWR)
+            for i in range(3):
+                os.dup2(fd, i)
+            os.close(fd)
+            # Start real bash — full featured
+            os.execv('/bin/bash',
+                ['/bin/bash', '-i', '--login'])
+            os._exit(1)
+
+        self.ghost_pid = pid
+        print(f"[GHOST] Real session PID={pid} on VT7")
+        print(f"[GHOST] Switch to VT7: chvt 7")
+        print(f"[GHOST] Or: ssh user@localhost")
+
+
+# ============================================================
+# LAYER 3: ACCESS MONITOR
+# Watches for attacker interactions with decoy
+# ============================================================
+
+class AccessMonitor:
+    """
+    Monitors for attacker behavior changes
+    in response to puppet activity.
+
+    Key behavioral indicators:
+    - Response timing to puppet 'discoveries'
+    - Module loads after specific puppet actions
+    - Network connections triggered by puppet cmds
+    - USB events correlated with puppet activity
+    """
+
+    def __init__(self):
+        self.events     = []
+        self.baselines  = {}
+        os.makedirs(EVIDENCE_DIR, exist_ok=True)
+        self.log_file   = os.path.join(
+            EVIDENCE_DIR,
+            f'behavior_{int(time.time())}.log'
+        )
+
+    def log(self, event_type, data):
+        ts = datetime.now().isoformat()
+        entry = f"[{ts}] {event_type}: {data}"
+        self.events.append({
+            'ts': ts,
+            'type': event_type,
+            'data': data
+        })
+        with open(self.log_file, 'a') as f:
+            f.write(entry + '\n')
+        print(f"[MONITOR] {entry}")
+
+    def baseline_modules(self):
+        """Record module state for comparison"""
+        result = subprocess.run(
+            ['lsmod'],
+            capture_output=True, text=True
+        )
+        self.baselines['modules'] = set(
+            line.split()[0]
+            for line in result.stdout.splitlines()[1:]
+        )
+
+    def baseline_network(self):
+        """Record network state"""
+        result = subprocess.run(
+            ['ss', '-tupan'],
+            capture_output=True, text=True
+        )
+        self.baselines['network'] = result.stdout
+
+    def check_modules(self):
+        """Detect new modules since baseline"""
+        result = subprocess.run(
+            ['lsmod'],
+            capture_output=True, text=True
+        )
+        current = set(
+            line.split()[0]
+            for line in result.stdout.splitlines()[1:]
+        )
+        new = current - self.baselines.get('modules', set())
+        for mod in new:
+            self.log('NEW_MODULE', mod)
+        return new
+
+    def check_network(self):
+        """Detect new connections"""
+        result = subprocess.run(
+            ['ss', '-tupan'],
+            capture_output=True, text=True
+        )
+        current = result.stdout
+        baseline = self.baselines.get('network', '')
+        new_lines = set(current.splitlines()) - \
+                    set(baseline.splitlines())
+        for line in new_lines:
+            if line.strip():
+                self.log('NEW_CONNECTION', line.strip())
+
+    def run(self, puppet_log):
+        """
+        Main monitoring loop.
+        Correlates attacker behavior changes
+        with puppet actions.
+        """
+        self.baseline_modules()
+        self.baseline_network()
+
+        self.log('MONITOR_START', 'Baselines established')
+
+        while True:
+            time.sleep(1.0)
+
+            # Check for behavioral changes
+            new_mods = self.check_modules()
+            self.check_network()
+
+            # Correlate with recent puppet actions
+            if new_mods and puppet_log:
+                recent = puppet_log[-3:] if puppet_log else []
+                self.log(
+                    'CORRELATION',
+                    f"New modules {new_mods} after "
+                    f"puppet actions: {recent}"
+                )
+
+            # Check if they're watching —
+            # framebuffer read rate increases
+            # when content changes (KVM polling)
+            fb_stat = os.stat(FB_DEVICE) \
+                if os.path.exists(FB_DEVICE) else None
+            if fb_stat:
+                # atime changes = being read
+                pass
+
+
+# ============================================================
+# GRUB-LEVEL SETUP COMMANDS
+# Run these at GRUB prompt to hook before their toolkit
+# ============================================================
+
+GRUB_SETUP_SEQUENCE = """
+# ============================================================
+# CTW-11 GHOST SHELL GRUB SETUP SEQUENCE
+# Run at grub> prompt BEFORE their toolkit initializes
+# ============================================================
+
+# Step 1 — Verify we're before their MITM
+# (cursor smooth = we're ahead)
+
+# Step 2 — Load required modules
+insmod part_gpt
+insmod fat
+insmod ext2
+insmod video_fb
+insmod serial
+
+# Step 3 — Set terminal to serial as secondary
+# This gives us a hidden output channel
+# Serial output bypasses framebuffer entirely
+# AMT KVM cannot see serial output
+terminal_output --append serial
+serial --unit=0 --speed=115200
+
+# Step 4 — Override their environment variables
+# Set check_signatures back to yes
+# (was 'no' in their config)
+set check_signatures=yes
+
+# Step 5 — Capture their toolkit location
+# before loading our kernel
+set ctw_toolkit_base=0x72db60000
+set ctw_kvm_handle=0x7d34dcd8
+set ctw_me_base=0xffa00000
+
+# Step 6 — Set kernel params to start ghost
+# before USB initializes at 0.827s
+# rd.ctw_ghost=1 tells our initramfs hook to run
+set ctw_kparams="rd.ctw_ghost=1 \\
+  rd.ctw_puppet_vt=1 \\
+  rd.ctw_real_vt=7 \\
+  rd.ctw_toolkit=0x72db60000 \\
+  vt.handoff=7"
+
+# vt.handoff=7 tells kernel to hand off
+# framebuffer to VT7 not VT1
+# We then control what VT1 shows
+
+# Step 7 — Load our kernel with ghost params
+linuxefi (hd0,gpt2)/boot/vmlinuz \\
+  root=LABEL=ROCKY_RO \\
+  ro quiet \\
+  $ctw_kparams \\
+  init_on_alloc=1 slab_nomerge \\
+  lockdown=confidentiality \\
+  module.sig_enforce=1
+
+initrdefi (hd0,gpt2)/boot/initramfs.img
+
+# Step 8 — Boot
+boot
+"""
+
+# ============================================================
+# MAIN INSTALLER
+# ============================================================
+
+def install():
+    """Install the ghost shell system"""
+
+    print("CTW-11 GHOST SHELL INSTALLER")
+    print("="*40)
+
+    # Create directories
+    os.makedirs('/tmp/ctw_ghost', exist_ok=True)
+    os.makedirs(EVIDENCE_DIR, exist_ok=True)
+
+    # Write GRUB setup sequence
+    with open('/tmp/ctw_ghost/grub_setup.txt', 'w') as f:
+        f.write(GRUB_SETUP_SEQUENCE)
+    print("[+] GRUB setup sequence written")
+
+    # Write initramfs hook
+    hook_dir = '/etc/initramfs-tools/scripts/init-premount'
+    if os.path.exists('/etc/initramfs-tools'):
+        os.makedirs(hook_dir, exist_ok=True)
+        with open(f'{hook_dir}/ctw_ghost', 'w') as f:
+            f.write(INITRAMFS_HOOK)
+        os.chmod(f'{hook_dir}/ctw_ghost', 0o755)
+        print("[+] Initramfs hook installed")
+    else:
+        # Dracut hook
+        dracut_dir = '/etc/dracut.conf.d'
+        hook_file = '/usr/lib/dracut/hooks/pre-udev/99-ctw-ghost.sh'
+        os.makedirs(os.path.dirname(hook_file), exist_ok=True)
+        with open(hook_file, 'w') as f:
+            f.write(GRUB_HOOK)
+        os.chmod(hook_file, 0o755)
+        print("[+] Dracut hook installed")
+
+    # Write puppet script for direct execution
+    puppet_script = '''#!/bin/bash
+# CTW-11 PUPPET SCRIPT
+# Run on VT1 — attacker watches this
+
+while true; do
+    python3 /tmp/ctw_ghost/ghost_shell.py --puppet
+    sleep 2
+done
+'''
+    with open('/tmp/ctw_ghost/puppet.sh', 'w') as f:
+        f.write(puppet_script)
+    os.chmod('/tmp/ctw_ghost/puppet.sh', 0o755)
+    print("[+] Puppet script written")
+
+    print("\n[+] Installation complete")
+    print("\nNext steps:")
+    print("  1. Copy grub setup sequence:")
+    print("     cat /tmp/ctw_ghost/grub_setup.txt")
+    print("  2. Rebuild initramfs:")
+    print("     dracut --force --regenerate-all")
+    print("  3. Or run puppet directly now:")
+    print("     bash /tmp/ctw_ghost/puppet.sh &")
+    print("  4. Switch to real session:")
+    print("     chvt 7")
+
+
+def run_puppet_only():
+    """Run just the puppet layer on current VT"""
+    master, slave = pty.openpty()
+
+    pid = os.fork()
+    if pid == 0:
+        os.setsid()
+        for i in range(3):
+            os.dup2(slave, i)
+        os.execv('/bin/bash', ['bash', '--norc'])
+        os._exit(1)
+
+    # Set raw mode on slave
+    tty.setraw(slave)
+
+    puppet = PuppetTerminal()
+    print(f"[PUPPET] Starting on PID={pid}")
+    print(f"[PUPPET] Real session: chvt 7")
+
+    puppet.run(master)
+
+
+def run_monitor():
+    """Run access monitor standalone"""
+    monitor = AccessMonitor()
+    monitor.log('START', f'Monitoring for attacker behavior')
+    monitor.run([])
+
+
+def run_full():
+    """Full ghost shell deployment"""
+    ghost = GhostSession()
+
+    # Establish baselines
+    ghost.monitor.baseline_modules()
+    ghost.monitor.baseline_network()
+
+    # Lock VT switching
+    ghost.lock_vt_switching()
+
+    # Start puppet on VT1
+    puppet_master = ghost.start_puppet()
+
+    # Start real session on VT7
+    ghost.start_ghost()
+
+    # Start monitor in background
+    monitor_thread = threading.Thread(
+        target=ghost.monitor.run,
+        args=([],),
+        daemon=True
+    )
+    monitor_thread.start()
+
+    print("\n" + "="*50)
+    print("CTW-11 GHOST SHELL ACTIVE")
+    print("="*50)
+    print(f"Puppet (decoy):  VT1  — attacker watches this")
+    print(f"Real session:    VT7  — chvt 7 to access")
+    print(f"Evidence:        {EVIDENCE_DIR}")
+    print(f"Monitor log:     {ghost.monitor.log_file}")
+    print("="*50)
+    print("\nSwitch to real session now: chvt 7")
+    print("Return to monitor puppet:   chvt 1")
+    print("\nThe puppet is working. Attacker is watching.")
+    print("You are invisible on VT7.\n")
+
+    # Keep main thread alive
+    try:
+        while True:
+            time.sleep(5)
+            # Periodic behavior report
+            if ghost.monitor.events:
+                last = ghost.monitor.events[-1]
+                print(f"[{last['ts']}] "
+                      f"{last['type']}: {last['data']}")
+    except KeyboardInterrupt:
+        print("\nGhost shell stopping...")
+        # Hash evidence
+        subprocess.run([
+            'find', EVIDENCE_DIR, '-type', 'f',
+            '-exec', 'sha256sum', '{}', ';'
+        ])
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
+
+if __name__ == '__main__':
+    if len(sys.argv) < 2:
+        print(__doc__)
+        print("\nUsage:")
+        print("  python3 ghost_shell.py install")
+        print("  python3 ghost_shell.py run")
+        print("  python3 ghost_shell.py puppet")
+        print("  python3 ghost_shell.py monitor")
+        sys.exit(0)
+
+    cmd = sys.argv[1]
+
+    if cmd == 'install':
+        install()
+    elif cmd == 'run':
+        run_full()
+    elif cmd == 'puppet':
+        run_puppet_only()
+    elif cmd == 'monitor':
+        run_monitor()
+    elif cmd == '--puppet':
+        run_puppet_only()
+    else:
+        print(f"Unknown command: {cmd}")
+        sys.exit(1)
